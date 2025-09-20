@@ -253,7 +253,20 @@ def build_short_and_upload(riddle_row, idx, creds, privacy="public"):
     video = concatenate_videoclips(slides, method="compose")
 
     if Path(LOGO_PATH).exists():
-        logo = ImageClip(str(LOGO_PATH)).set_duration(video.duration).resize(width=140).set_pos(("right", "top")).margin(right=32, top=32)
+        # Resize logo manually using Pillow
+        if Path(LOGO_PATH).exists():
+            logo_img = Image.open(LOGO_PATH)
+            # Calculate new height to maintain aspect ratio
+            w_percent = 140 / float(logo_img.width)
+            h_size = int(float(logo_img.height) * w_percent)
+            logo_img = logo_img.resize((140, h_size), Image.Resampling.LANCZOS)
+            
+            tmp_logo = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            logo_img.save(tmp_logo.name)
+            tmp_logo.close()
+        
+            logo = ImageClip(tmp_logo.name).set_duration(video.duration).set_pos(("right", "top")).margin(right=32, top=32)
+
         video = CompositeVideoClip([video, logo])
 
     tts_text = f"{hook}. {body}. Option A: {opt1}. Option B: {opt2}. Option C: {opt3}. The answer is {answer}."
