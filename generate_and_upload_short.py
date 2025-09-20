@@ -240,9 +240,9 @@ def build_short_and_upload(riddle_row, idx, creds, privacy="public"):
     # Compose text slides
     hook = str(riddle_row["Hook"])
     body = str(riddle_row["Body"])
-    opt1 = str(riddle_row["Option1"])
-    opt2 = str(riddle_row["Option2"])
-    opt3 = str(riddle_row["Option3"])
+    opt1 = str(riddle_row["Option 1"])
+    opt2 = str(riddle_row["Option 2"])
+    opt3 = str(riddle_row["Option 3"])
     answer = str(riddle_row["Answer"])
     title_text = str(riddle_row.get("Title", f"Riddle #{idx}"))
 
