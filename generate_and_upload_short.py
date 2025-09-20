@@ -217,7 +217,7 @@ def load_next_riddle():
     # Normalize column names
     df.columns = [c.strip() for c in df.columns]
     # Ensure columns exist
-    needed = ["Title", "Hook", "Body", "Option1", "Option2", "Option3", "Answer"]
+    needed = ["Title", "Hook", "Body", "Option 1", "Option 2", "Option 3", "Answer", "Uploaded"]
     for n in needed:
         if n not in df.columns:
             raise ValueError(f"Missing column in Excel: {n}")
