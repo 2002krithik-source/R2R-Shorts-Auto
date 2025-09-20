@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
 generate_and_upload_short.py
-
-- Picks the first row in riddles.xlsx where Uploaded is empty/False.
-- Generates a 9:16 short (1080x1920) with:
-    * background (assets/backgrounds/*.mp4 or assets/bg.jpg fallback)
-    * animated text slides (hook -> body -> options -> answer reveal)
-    * voiceover (gTTS by default)
-    * background music (assets/music/*.mp3 optional)
-    * small logo overlay (assets/logo.png optional)
-- Uploads to YouTube using OAuth refresh token
-- Marks the row's Uploaded column TRUE and saves riddles.xlsx
+Fully updated to fix Pillow ANTIALIAS and Excel column issues.
 """
 
 import os
@@ -40,21 +31,20 @@ from googleapiclient.http import MediaFileUpload
 WIDTH = 1080
 HEIGHT = 1920
 ASSETS_DIR = Path("assets")
-BG_VIDEO_GLOB = ASSETS_DIR / "backgrounds" / "*.mp4"   # optional loopable vertical backgrounds
-BG_IMAGE = ASSETS_DIR / "bg.jpg"                       # fallback
-MUSIC_GLOB = ASSETS_DIR / "music" / "*.mp3"            # optional
-LOGO_PATH = ASSETS_DIR / "logo.png"                    # optional
-FONT_PATH = ASSETS_DIR / "fonts" / "Roboto-Bold.ttf"   # optional (better typography)
+BG_VIDEO_GLOB = ASSETS_DIR / "backgrounds" / "*.mp4"
+BG_IMAGE = ASSETS_DIR / "bg.jpg"
+MUSIC_GLOB = ASSETS_DIR / "music" / "*.mp3"
+LOGO_PATH = ASSETS_DIR / "logo.png"
+FONT_PATH = ASSETS_DIR / "fonts" / "Roboto-Bold.ttf"
 EXCEL_PATH = Path("riddles.xlsx")
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 VOICE_LANG = "en"
 
-# YouTube OAuth
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-# Slide durations (seconds)
+# Slide durations
 HOOK_DURATION = 3.0
 BODY_DURATION = 5.0
 OPTIONS_DURATION = 5.0
@@ -73,32 +63,32 @@ TEXT_MARGIN = 80
 
 # ---------------- Helpers ----------------
 def pick_background_clip(duration):
-    # Prefer video backgrounds, else static image
     vids = list(glob.glob(str(BG_VIDEO_GLOB)))
     if vids:
         path = random.choice(vids)
         clip = VideoFileClip(path).resize(height=HEIGHT)
-        # crop/center to WIDTH if needed
         clip = clip.fx(lambda c: c.crop(x1=0, y1=0, x2=c.w, y2=c.h)) if clip.w != WIDTH else clip
-        # ensure long enough by looping
         if clip.duration < duration:
             loops = math.ceil(duration / clip.duration)
             clips = [clip] * loops
             clip = concatenate_videoclips(clips).set_duration(duration)
         else:
             clip = clip.subclip(0, duration)
-        clip = clip.resize((WIDTH, HEIGHT))
-        return clip
-    # fallback to static image
+        return clip.resize((WIDTH, HEIGHT))
+
     if BG_IMAGE.exists():
-        img_clip = ImageClip(str(BG_IMAGE)).set_duration(duration).resize((WIDTH, HEIGHT))
-        return img_clip
-    # fallback to plain background
+        img = Image.open(BG_IMAGE)
+        img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        img.save(tmp.name)
+        tmp.close()
+        return ImageClip(tmp.name).set_duration(duration)
+
     img = Image.new("RGB", (WIDTH, HEIGHT), color=(20, 20, 25))
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     img.save(tmp.name)
     tmp.close()
-    return ImageClip(tmp.name).set_duration(duration).resize((WIDTH, HEIGHT))
+    return ImageClip(tmp.name).set_duration(duration)
 
 def pick_music_clip(duration):
     files = list(glob.glob(str(MUSIC_GLOB)))
@@ -106,27 +96,25 @@ def pick_music_clip(duration):
         return None
     path = random.choice(files)
     music = AudioFileClip(path)
-    # loop music if needed
     if music.duration < duration:
         loops = math.ceil(duration / music.duration)
-        clips = [music] * loops
         from moviepy.editor import concatenate_audioclips
-        music = concatenate_audioclips(clips).set_duration(duration)
+        music = concatenate_audioclips([music] * loops).set_duration(duration)
     else:
         music = music.subclip(0, duration)
-    # lower volume
     return music.volumex(0.12)
 
+def text_size(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    return width, height
+
 def render_text_image(text, fontsize, size=(WIDTH, HEIGHT), align="center"):
-    # Renders text to transparent image and returns path
     img = Image.new("RGBA", size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # font
     try:
-        if Path(FONT_PATH).exists():
-            font = ImageFont.truetype(str(FONT_PATH), fontsize)
-        else:
-            font = ImageFont.truetype("arial.ttf", fontsize)
+        font = ImageFont.truetype(str(FONT_PATH), fontsize) if Path(FONT_PATH).exists() else ImageFont.truetype("arial.ttf", fontsize)
     except Exception:
         font = ImageFont.load_default()
 
@@ -136,7 +124,7 @@ def render_text_image(text, fontsize, size=(WIDTH, HEIGHT), align="center"):
     cur = ""
     for w in words:
         test = (cur + " " + w).strip()
-        wsize = draw.textsize(test, font=font)[0]
+        wsize, _ = text_size(draw, test, font)
         if wsize <= maxw:
             cur = test
         else:
@@ -145,20 +133,22 @@ def render_text_image(text, fontsize, size=(WIDTH, HEIGHT), align="center"):
     if cur:
         lines.append(cur)
 
-    line_h = draw.textsize("Ay", font=font)[1] + 8
+    _, line_h = text_size(draw, "Ay", font)
+    line_h += 8
     total_h = line_h * len(lines)
     y = (size[1] - total_h) // 2
 
     for line in lines:
-        w, h = draw.textsize(line, font=font)
+        w, h = text_size(draw, line, font)
         x = (size[0] - w) // 2 if align == "center" else TEXT_MARGIN
-        # draw outline for legibility
+        # outline
         draw.text((x-2, y-2), line, font=font, fill="black")
         draw.text((x+2, y-2), line, font=font, fill="black")
         draw.text((x-2, y+2), line, font=font, fill="black")
         draw.text((x+2, y+2), line, font=font, fill="black")
         draw.text((x, y), line, font=font, fill=TEXT_COLOR)
         y += line_h
+
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     img.save(tmp.name)
     tmp.close()
@@ -181,7 +171,7 @@ def get_credentials_from_refresh_token(client_id, client_secret, refresh_token):
     token = info.get("access_token")
     if not token:
         raise RuntimeError("Failed to refresh access token.")
-    creds = Credentials(
+    return Credentials(
         token=token,
         refresh_token=refresh_token,
         client_id=client_id,
@@ -189,7 +179,6 @@ def get_credentials_from_refresh_token(client_id, client_secret, refresh_token):
         token_uri=TOKEN_URI,
         scopes=SCOPES,
     )
-    return creds
 
 def upload_to_youtube(video_file, title, description, credentials, tags=None, privacy="public"):
     youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
@@ -214,47 +203,40 @@ def load_next_riddle():
     if not EXCEL_PATH.exists():
         raise FileNotFoundError(f"{EXCEL_PATH} not found.")
     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
-    # Normalize column names
-    df.columns = [c.strip() for c in df.columns]
-    # Ensure columns exist
-    needed = ["Title", "Hook", "Body", "Option 1", "Option 2", "Option 3", "Answer", "Uploaded"]
-    for n in needed:
+    df.columns = [c.strip().replace(" ", "_").lower() for c in df.columns]
+    # Ensure required columns exist
+    for n in ["title", "hook", "body", "option_1", "option_2", "option_3", "answer"]:
         if n not in df.columns:
             raise ValueError(f"Missing column in Excel: {n}")
-    # If Uploaded column missing, create it
-    if "Uploaded" not in df.columns:
-        df["Uploaded"] = False
+    if "uploaded" not in df.columns:
+        df["uploaded"] = False
 
-    # find first not uploaded
     for idx, row in df.iterrows():
-        v = row.get("Uploaded")
+        v = row.get("uploaded")
         if not (str(v).strip().lower() in ["true", "1"]):
             return df, idx, row
     return df, None, None
 
 def mark_uploaded_and_save(df, idx):
-    df.at[idx, "Uploaded"] = True
+    df.at[idx, "uploaded"] = True
     df.to_excel(EXCEL_PATH, index=False, engine="openpyxl")
 
 def build_short_and_upload(riddle_row, idx, creds, privacy="public"):
-    # Compose text slides
-    hook = str(riddle_row["Hook"])
-    body = str(riddle_row["Body"])
-    opt1 = str(riddle_row["Option 1"])
-    opt2 = str(riddle_row["Option 2"])
-    opt3 = str(riddle_row["Option 3"])
-    answer = str(riddle_row["Answer"])
-    title_text = str(riddle_row.get("Title", f"Riddle #{idx}"))
+    hook = str(riddle_row.get("hook", ""))
+    body = str(riddle_row.get("body", ""))
+    opt1 = str(riddle_row.get("option_1", ""))
+    opt2 = str(riddle_row.get("option_2", ""))
+    opt3 = str(riddle_row.get("option_3", ""))
+    answer = str(riddle_row.get("answer", ""))
+    title_text = str(riddle_row.get("title", f"Riddle #{idx}"))
 
-    # Duration estimate: sum durations
     total_audio_length = HOOK_DURATION + BODY_DURATION + OPTIONS_DURATION + ANSWER_DURATION + PADDING_AFTER_AUDIO
     bg_clip = pick_background_clip(total_audio_length)
 
-    # Render image slides
+    # Render slides
     hook_img = render_text_image(hook, HOOK_FONT_SIZE)
     body_img = render_text_image(body, BODY_FONT_SIZE)
-    options_text = f"A) {opt1}\nB) {opt2}\nC) {opt3}"
-    options_img = render_text_image(options_text, OPTION_FONT_SIZE)
+    options_img = render_text_image(f"A) {opt1}\nB) {opt2}\nC) {opt3}", OPTION_FONT_SIZE)
     answer_img = render_text_image("Answer: " + answer, ANSWER_FONT_SIZE)
 
     hook_clip = ImageClip(hook_img).set_duration(HOOK_DURATION)
@@ -262,7 +244,6 @@ def build_short_and_upload(riddle_row, idx, creds, privacy="public"):
     options_clip = ImageClip(options_img).set_duration(OPTIONS_DURATION)
     answer_clip = ImageClip(answer_img).set_duration(ANSWER_DURATION)
 
-    # Composite each slide over the background
     slides = []
     for slide_clip in [hook_clip, body_clip, options_clip, answer_clip]:
         sub_bg = bg_clip.subclip(0, slide_clip.duration).set_duration(slide_clip.duration)
@@ -270,76 +251,60 @@ def build_short_and_upload(riddle_row, idx, creds, privacy="public"):
         slides.append(comp)
 
     video = concatenate_videoclips(slides, method="compose")
-    # Add logo
+
     if Path(LOGO_PATH).exists():
         logo = ImageClip(str(LOGO_PATH)).set_duration(video.duration).resize(width=140).set_pos(("right", "top")).margin(right=32, top=32)
         video = CompositeVideoClip([video, logo])
 
-    # TTS voiceover
     tts_text = f"{hook}. {body}. Option A: {opt1}. Option B: {opt2}. Option C: {opt3}. The answer is {answer}."
     tts_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tts_save(tts_text, tts_tmp.name)
     tts_tmp.close()
     voice_audio = AudioFileClip(tts_tmp.name)
 
-    # Optionally pick music and mix
     music = pick_music_clip(voice_audio.duration + PADDING_AFTER_AUDIO)
     if music:
         from moviepy.editor import CompositeAudioClip
-        voice_audio = voice_audio.set_duration(voice_audio.duration)
-        composed = CompositeAudioClip([voice_audio, music.set_duration(voice_audio.duration + PADDING_AFTER_AUDIO)])
-        composed = composed.set_duration(voice_audio.duration + PADDING_AFTER_AUDIO)
-        final_audio = composed
+        final_audio = CompositeAudioClip([voice_audio, music.set_duration(voice_audio.duration + PADDING_AFTER_AUDIO)]).set_duration(voice_audio.duration + PADDING_AFTER_AUDIO)
     else:
         final_audio = voice_audio
 
-    # attach audio and ensure video length covers audio
     if video.duration < final_audio.duration:
         video = video.set_duration(final_audio.duration)
     video = video.set_audio(final_audio)
 
-    # final file
     out_path = OUTPUT_DIR / f"riddle_short_{idx}_{int(time.time())}.mp4"
     video.write_videofile(str(out_path), fps=24, codec="libx264", audio_codec="aac", threads=0, remove_temp=True)
-    # cleanup temp images & audio
-    for f in [hook_img, body_img, options_img, answer_img, tts_tmp.name]:
-        try:
-            os.remove(f)
-        except Exception:
-            pass
 
-    # Upload to YouTube
+    for f in [hook_img, body_img, options_img, answer_img, tts_tmp.name]:
+        try: os.remove(f)
+        except Exception: pass
+
     vid_title = f"{title_text} — Quick Riddle"
-    description = (
-        f"{hook}\n\n{body}\n\nOptions:\nA) {opt1}\nB) {opt2}\nC) {opt3}\n\nAnswer: {answer}\n\n#riddle #shorts"
-    )
+    description = f"{hook}\n\n{body}\n\nOptions:\nA) {opt1}\nB) {opt2}\nC) {opt3}\n\nAnswer: {answer}\n\n#riddle #shorts"
     resp = upload_to_youtube(str(out_path), vid_title, description, creds, tags=["riddle", "shorts", "puzzle"], privacy=privacy)
     return resp
 
 def main():
-    # read env
     YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID")
     YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET")
     YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN")
-    PRIVACY = os.environ.get("VIDEO_PRIVACY", "public")  # public/unlisted/private
+    PRIVACY = os.environ.get("VIDEO_PRIVACY", "public")
 
     if not (YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN):
-        raise EnvironmentError("Set YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN env vars in workflow/secrets")
+        raise EnvironmentError("Set YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN env vars.")
 
-    # Load next riddle
     df, idx, row = load_next_riddle()
     if idx is None:
-        print("No more unridden riddles found (Uploaded column all True). Exiting.")
+        print("No more unridden riddles found. Exiting.")
         return
 
-    print(f"Selected row {idx}: {row.get('Title', '')}")
+    print(f"Selected row {idx}: {row.get('title', '')}")
     creds = get_credentials_from_refresh_token(YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN)
 
-    # Build, upload
     resp = build_short_and_upload(row, idx, creds, privacy=PRIVACY)
     print("Upload response:", resp)
 
-    # Mark uploaded and save Excel
     mark_uploaded_and_save(df, idx)
     print(f"Marked row {idx} as Uploaded and saved {EXCEL_PATH}")
 
