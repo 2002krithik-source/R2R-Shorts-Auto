@@ -1,0 +1,10 @@
+pandas
+openpyxl
+moviepy==1.0.3
+Pillow
+gTTS
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+requests
